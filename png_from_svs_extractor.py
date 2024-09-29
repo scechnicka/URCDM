@@ -1,55 +1,37 @@
-from collections import Counter
-import random 
-import time
-import torch
-from matplotlib import pyplot as plt
-from torch.utils.data import Dataset
-import torchvision.transforms as T
-import torch.nn.functional as F
-import slideio
-from tqdm import tqdm
-from skimage import color
-import numpy as np
-from PIL import Image
-
-import glob 
+import argparse
+import random
 import os
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+from collections import Counter
+import slideio
+from skimage import color
 
-MAG_LEVEL_SIZES = [40000, 6500, 1024]
-FILL_COLOR = (242, 243, 242)
+# Constants
+MAG_LEVEL_SIZES = [40000, 6500, 1024]  # Corresponding sizes for magnification levels
+FILL_COLOR = (242, 243, 242)  # Fill color for empty areas
 
-
-class PatientDataset(Dataset):
-    def __init__(self, svs_dir, magnification_level, verbose=False, center_cond=False, annotated_dataset=False):
-        super().__init__()
-
-        self.patch_size = 1024
-        self.center_cond = center_cond
+# PatientDataset Class
+class PatientDataset:
+    def __init__(self, svs_dir, magnification_level, patch_size=1024):
+        self.patch_size = patch_size
         self.magnification_level = magnification_level
-        
-        
+        self.svs_dir = svs_dir
         self.train_patch_positions = []
         self.train_slide_ids = []
-
-        self.svs_dir = svs_dir
-        self.num_train_patches = 0
         self.slide_name_to_index = {}
+        self.num_train_patches = 0
 
-
+        # Process .svs files
         svs_files = self.find_files_with_extension(svs_dir, '.svs')
         for index, slide_id in enumerate(tqdm(svs_files, desc="Processing slides")):
             slide = slideio.open_slide(slide_id, "SVS")
-            metadata = slide.raw_metadata.split("|")
-            for prop in metadata:
-                if prop.startswith("Filename = "):
-                    slide_name = prop.replace("Filename = ", "").split(" ")[0]
-                    self.slide_name_to_index[slide_name] = index
-
             image = slide.get_scene(0)
 
             # Resize the image to blocks of the patch size
-            small_img = image.read_block(image.rect,
-                                         size=(image.size[0] // self.patch_size, image.size[1] // self.patch_size))
+            small_img = image.read_block(image.rect, size=(image.size[0] // self.patch_size, image.size[1] // self.patch_size))
 
             # Mask out the background
             img_hs = color.rgb2hsv(small_img)
@@ -61,19 +43,9 @@ class PatientDataset(Dataset):
             # Scale the positions to the original image size
             patch_positions = patch_positions * self.patch_size
                 
-            
             self.train_slide_ids.append(slide_id)
             self.train_patch_positions.append(patch_positions)
             self.num_train_patches += len(patch_positions)
-            print(len(patch_positions))
-
-    def index_to_slide(self, index):
-        for i in range(len(self.train_slide_ids)):
-            if index < len(self.train_patch_positions[i]):
-                patch_position = self.train_patch_positions[i][index]
-                return i, (patch_position[1], patch_position[0])
-            else:
-                index -= len(self.train_patch_positions[i])
 
     def find_files_with_extension(self, directory, extension):
         file_paths = []
@@ -83,46 +55,31 @@ class PatientDataset(Dataset):
                     file_path = os.path.join(root, file)
                     file_paths.append(file_path)
         return file_paths
-    
+
     def __len__(self):
         if self.magnification_level == 0:
             return len(self.train_slide_ids)
         else:
             return self.num_train_patches
 
+    def index_to_slide(self, index):
+        for i in range(len(self.train_slide_ids)):
+            if index < len(self.train_patch_positions[i]):
+                patch_position = self.train_patch_positions[i][index]
+                return i, (patch_position[1], patch_position[0])
+            else:
+                index -= len(self.train_patch_positions[i])
 
-    def read_block_mag_zero(self, index):
-        slide_index = index
-        slide = slideio.open_slide(self.train_slide_ids[slide_index], "SVS").get_scene(0)
-        #slide = slideio.open_slide(self.svs_dir + self.train_slide_ids[slide_index]+'.svs', "SVS").get_scene(0)
-        width, height = slide.size
-
-        center_x = width // 2
-        center_y = height // 2
-        zoomed_size = MAG_LEVEL_SIZES[self.magnification_level]
-        x = center_x - zoomed_size // 2
-        y = center_y - zoomed_size // 2
-
-        return self.read_block(index, 0, x, y, slide=slide)
-
-    # x y is the coordinate of the top-left corner of the patch to read in the overall image
-    # mag_level controls the magnification of the patch
     def read_block(self, slide_index, mag_level, x, y, slide=None):
-        if slide == None:
-            slide = slideio.open_slide(self.train_slide_ids[slide_index], "SVS").get_scene(0)
-
+        slide = slide or slideio.open_slide(self.train_slide_ids[slide_index], "SVS").get_scene(0)
         width, height = slide.size
-
         image_size = MAG_LEVEL_SIZES[mag_level]
 
         patch = np.full((self.patch_size, self.patch_size, 3), FILL_COLOR)
 
-        # if coords are negative, cap to 0
+        # Cropping calculations
         cropped_x = max(x, 0)
         cropped_y = max(y, 0)
-
-        # if coords are negative, then the section that is out of bounds
-        # should count towards the image_size so we should trim this off
         x_trim = max(-x, 0)
         y_trim = max(-y, 0)
 
@@ -134,63 +91,48 @@ class PatientDataset(Dataset):
 
         cropped_patch = slide.read_block((cropped_x, cropped_y, cropped_width, cropped_height), size=(patch_width, patch_height))
 
-        # x and y are relative to the actual kidney image, and we need coordinates
-        # relative to the patch we are returning. x and y define the top-left corner
-        # of the patch, which is coordinate [0,0] so by subtracting x and y from a set
-        # of coordinates, it now is relative to the patch. So we subtract x and y from
-        # cropped_x and cropped_y to get the right coordinates.
-
         patch_x = cropped_x - x
         patch_y = cropped_y - y
-
-        # need to multiply by (self.patch_size / image_size) to change coordinates into
-        # the same magnification as the patch, rather than the whole slide.
         patch_x = int(patch_x * (self.patch_size / image_size))
         patch_y = int(patch_y * (self.patch_size / image_size))
 
         patch[patch_y:patch_y+patch_height, patch_x:patch_x+patch_width] = cropped_patch
 
-        # Convert the patch to a tensor
-        patch = torch.from_numpy(patch / 255).permute((2, 0, 1)).float()
-
-        return patch
-
-
-    def read_block_and_zoomed(self, index):
-        slide_index, patch_position = self.index_to_slide(index)
-
-        x, y = (patch_position[0], patch_position[1])
-        image_size = MAG_LEVEL_SIZES[self.magnification_level]
-
-        patch = self.read_block(slide_index, self.magnification_level, x, y) 
-        return patch
-
+        return torch.from_numpy(patch / 255).permute((2, 0, 1)).float()
 
     def __getitem__(self, index):
-        # size of higher mag patch within the zoomed_patch (once a center crop is made)
-        patch_width = int(MAG_LEVEL_SIZES[self.magnification_level] * self.patch_size / MAG_LEVEL_SIZES[self.magnification_level - 1])
-        
-        if self.magnification_level > 0:
-            patch = self.read_block_and_zoomed(index)
-            return patch
+        if self.magnification_level == 0:
+            slide_index = index
+            patch = self.read_block(slide_index, 0, MAG_LEVEL_SIZES[0] // 2, MAG_LEVEL_SIZES[0] // 2)
         else:
-            patch = self.read_block_mag_zero(index)
-            return patch
+            slide_index, patch_position = self.index_to_slide(index)
+            patch = self.read_block(slide_index, self.magnification_level, patch_position[0], patch_position[1])
+        return patch
 
 
-dataset = PatientDataset(LOCATION_OF_DATASET_SVS, MAGNIFICATION_LEVEL)
-out_folder = LOCATION_TO_SAVE_PATCHES
-num_patches = NUMBER_OF_PATCHES_TO_SAVE
-num_samples = min(num_patches, len(dataset))
-print(len(dataset))
-# Generate a set of unique random indexes
-selected_indexes = random.sample(range(len(dataset)), num_samples)
-for i in tqdm((selected_indexes)):#range(len(dataset))):
-    # Convert torch tensor to NumPy array
-    numpy_array = dataset[i].cpu().numpy()
-    # Transpose the array to match the expected image shape [x, y, colors]
-    image_array = np.transpose(numpy_array, (1, 2, 0))
-    # Convert NumPy array to Pillow Image
-    image = Image.fromarray((image_array * 255).astype(np.uint8))
-    # Save the image as a PNG file
-    image.save(out_folder+str(i)+".png")
+# Main function to handle arguments
+def main(args):
+    dataset = PatientDataset(args.svs_dir, args.magnification_level)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    num_samples = min(args.num_patches, len(dataset))
+    selected_indexes = random.sample(range(len(dataset)), num_samples)
+
+    for i in tqdm(selected_indexes, desc="Saving patches"):
+        numpy_array = dataset[i].cpu().numpy()
+        image_array = np.transpose(numpy_array, (1, 2, 0))
+        image = Image.fromarray((image_array * 255).astype(np.uint8))
+        image.save(os.path.join(args.output_dir, f"{i}.png"))
+
+    print(f"Saved {num_samples} patches to {args.output_dir}")
+
+# Parse command line arguments
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Preprocess .svs files to extract patches.")
+    parser.add_argument('--svs_dir', type=str, required=True, help="Directory containing .svs files.")
+    parser.add_argument('--output_dir', type=str, required=True, help="Directory to save extracted patches.")
+    parser.add_argument('--num_patches', type=int, default=10000, help="Number of patches to extract.")
+    parser.add_argument('--magnification_level', type=int, choices=[0, 1, 2], required=True, help="Magnification level (0, 1, 2).")
+
+    args = parser.parse_args()
+    main(args)
